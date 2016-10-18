@@ -5,9 +5,13 @@ import com.twitter.conversions.time._
 import com.twitter.finagle.param.Label
 import com.twitter.finagle.tracing.NullTracer
 import com.twitter.finagle.{Stack, Http, Path}
+import com.twitter.io.Buf
+import com.twitter.util.Return
 import io.buoyant.config.types.Port
 import io.buoyant.namer.{NamerConfig, NamerInitializer}
 import io.buoyant.marathon.v2.{Api, AppIdNamer}
+import java.net.URL
+import pdi.jwt.{Jwt, JwtAlgorithm}
 
 /**
  * Supports namer configurations in the form:
@@ -29,6 +33,13 @@ class MarathonInitializer extends NamerInitializer {
 }
 
 object MarathonInitializer extends MarathonInitializer
+
+case class MarathonSecret(
+  login_endpoint: Option[String],
+  private_key: Option[String],
+  scheme: Option[String],
+  uid: Option[String]
+)
 
 case class MarathonConfig(
   host: Option[String],
@@ -53,6 +64,24 @@ case class MarathonConfig(
 
   private[this] def getDst = dst.getOrElse(s"/$$/inet/$getHost/$getPort")
 
+  val secretKey = "DCOS_SERVICE_ACCOUNT_CREDENTIAL"
+  private[this] def getAuth = {
+    if (sys.env.contains(secretKey)) {
+      Api.readJson[MarathonSecret](Buf.Utf8(sys.env(secretKey))) match {
+        case Return(MarathonSecret(Some(loginEndpoint), Some(privateKey), Some("RS256"), Some(uid))) =>
+          Some(
+            Api.Auth(
+              new URL(loginEndpoint).getPath,
+              s"""{"uid":"$uid","token":"${Jwt.encode(s"""{"uid":"$uid"}""", privateKey, JwtAlgorithm.RS256)}"}"""
+            )
+          )
+        case _ => None
+      }
+    } else {
+      None
+    }
+  }
+
   /**
    * Construct a namer.
    */
@@ -63,6 +92,6 @@ case class MarathonConfig(
       .withTracer(NullTracer)
       .newService(getDst)
 
-    new AppIdNamer(Api(service, getHost, getUriPrefix), prefix, getTtl)
+    new AppIdNamer(Api(service, getHost, getUriPrefix, getAuth), prefix, getTtl)
   }
 }

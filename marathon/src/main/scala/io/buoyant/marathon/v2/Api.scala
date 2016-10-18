@@ -6,7 +6,7 @@ import com.fasterxml.jackson.module.scala.experimental.ScalaObjectMapper
 import com.twitter.finagle.tracing.Trace
 import com.twitter.finagle.{Address, Path, Service, SimpleFilter, http}
 import com.twitter.io.Buf
-import com.twitter.util.{Closable, Future, Time, Try}
+import com.twitter.util.{Closable, Future, Return, Time, Try}
 
 /**
  * A partial implementation of the Marathon V2 API:
@@ -25,6 +25,11 @@ object Api {
 
   val versionString = "v2"
 
+  case class Auth(
+    path: String,
+    content: String
+  )
+
   private[this] case class SetHost(host: String)
     extends SimpleFilter[http.Request, http.Response] {
 
@@ -34,15 +39,16 @@ object Api {
     }
   }
 
-  def apply(client: Client, host: String, uriPrefix: String): Api =
-    new AppIdApi(SetHost(host).andThen(client), s"$uriPrefix/$versionString")
+  def apply(client: Client, host: String, uriPrefix: String, auth: Option[Auth]): Api =
+    new AppIdApi(SetHost(host).andThen(client), s"$uriPrefix/$versionString", auth)
 
   private[v2] def rspToApps(rsp: http.Response): Future[Api.AppIds] =
     rsp.status match {
       case http.Status.Ok =>
         val apps = readJson[AppsRsp](rsp.content).map(_.toApps)
         Future.const(apps)
-
+      case http.Status.Unauthorized =>
+        Future.exception(UnauthorizedResponse(rsp))
       case _ => Future.exception(UnexpectedResponse(rsp))
     }
 
@@ -51,16 +57,21 @@ object Api {
       case http.Status.Ok =>
         val addrs = readJson[AppRsp](rsp.content).map(_.toAddresses)
         Future.const(addrs)
-      case _ =>
-        Future.exception(UnexpectedResponse(rsp))
+      case http.Status.Unauthorized =>
+        Future.exception(UnauthorizedResponse(rsp))
+      case _ => Future.exception(UnexpectedResponse(rsp))
     }
+
+  private[v2] case class AuthToken(token: Option[String])
+
+  private[v2] case class UnauthorizedResponse(rsp: http.Response) extends Throwable
 
   private[this] case class UnexpectedResponse(rsp: http.Response) extends Throwable
 
   private[this] val mapper = new ObjectMapper with ScalaObjectMapper
   mapper.registerModule(DefaultScalaModule)
   mapper.configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
-  private[this] def readJson[T: Manifest](buf: Buf): Try[T] = {
+  def readJson[T: Manifest](buf: Buf): Try[T] = {
     val Buf.ByteArray.Owned(bytes, begin, end) = Buf.ByteArray.coerce(buf)
     Try(mapper.readValue[T](bytes, begin, end - begin))
   }
@@ -101,21 +112,90 @@ object Api {
   }
 }
 
-private class AppIdApi(client: Api.Client, apiPrefix: String)
+private class AppIdApi(client: Api.Client, apiPrefix: String, auth: Option[Api.Auth])
   extends Api
   with Closable {
 
   import Api._
 
+  var authToken: Option[String] = None
+
   def close(deadline: Time) = client.close(deadline)
 
-  def getAppIds(): Future[Api.AppIds] = {
-    val req = http.Request(s"$apiPrefix/apps")
-    Trace.letClear(client(req)).flatMap(rspToApps(_))
+  private[this] def refreshToken(): Future[String] =
+    auth match {
+      case Some(auth) =>
+        val req = http.Request(http.Method.Post, auth.path)
+        req.setContentTypeJson()
+        req.setContentString(auth.content)
+
+        Trace.letClear(client(req)).flatMap { rsp =>
+          rsp.status match {
+            case http.Status.Ok =>
+              readJson[AuthToken](rsp.content) match {
+                case Return(AuthToken(Some(token))) =>
+                  authToken = Some(token) // side effect
+                  Future.const(Return(token))
+                case _ => Future.exception(UnauthorizedResponse(rsp))
+              }
+            case _ => Future.exception(UnauthorizedResponse(rsp))
+          }
+        }
+      case _ => Future.value("")
+    }
+
+  private[this] def prepRequest(path: String): Future[http.Request] = {
+    val req = http.Request(path)
+    (authToken, auth) match {
+      case (Some(authToken), Some(auth)) => {
+        // already have a token, set it
+        req.headerMap.set("Authorization", s"token=$authToken")
+        Future.const(Return(req))
+      }
+      case (None, Some(auth)) => {
+        // need a token, query for it
+        refreshToken().flatMap { token =>
+          req.headerMap.set("Authorization", s"token=$token")
+          Future.const(Return(req))
+        }
+      }
+
+      // don't need a token
+      case _ => Future.const(Return(req))
+    }
   }
 
-  def getAddrs(app: Path): Future[Set[Address]] = {
-    val req = http.Request(s"$apiPrefix/apps${app.show}")
-    Trace.letClear(client(req)).flatMap(rspToAddrs(_))
-  }
+  def getAppIds(): Future[Api.AppIds] =
+    prepRequest(s"$apiPrefix/apps").flatMap { req =>
+      try {
+        Trace.letClear(client(req)).flatMap(rspToApps(_)).rescue {
+          case e: UnauthorizedResponse =>
+            // token may have expired, try again
+            refreshToken().flatMap { token =>
+              req.headerMap.set("Authorization", s"token=$token")
+              Trace.letClear(client(req)).flatMap(rspToApps(_))
+            }
+          case e => Future.exception(e)
+        }
+      } catch {
+        case e: Throwable => Future.exception(e)
+      }
+    }
+
+  def getAddrs(app: Path): Future[Set[Address]] =
+    prepRequest(s"$apiPrefix/apps${app.show}").flatMap { req =>
+      try {
+        Trace.letClear(client(req)).flatMap(rspToAddrs(_)).rescue {
+          case e: UnauthorizedResponse =>
+            // token may have expired, try again
+            refreshToken().flatMap { token =>
+              req.headerMap.set("Authorization", s"token=$token")
+              Trace.letClear(client(req)).flatMap(rspToAddrs(_))
+            }
+          case e => Future.exception(e)
+        }
+      } catch {
+        case e: Throwable => Future.exception(e)
+      }
+    }
 }

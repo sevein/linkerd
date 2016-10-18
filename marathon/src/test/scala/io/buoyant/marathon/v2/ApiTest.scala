@@ -56,16 +56,37 @@ class ApiTest extends FunSuite with Awaits with Exceptions {
 
   val appNotFoundBuf = Buf.Utf8("""{"message":"App '/foo' does not exist"}""")
 
+  val authbuf = Buf.Utf8("""{"token":"foo"}""")
+  val auth = Some(Api.Auth("/fakeauth", "fakecontent"))
+
   def stubService(buf: Buf) = Service.mk[Request, Response] { req =>
     val rsp = Response()
     rsp.content = buf
     Future.value(rsp)
   }
 
+  case class stubAuth(authbuf: Buf, buf: Buf) {
+    var authed = false
+    def service() =
+      Service.mk[Request, Response] { req =>
+        val rsp = Response()
+        if (!authed) {
+          assert(req.path == auth.get.path)
+          assert(req.contentString == auth.get.content)
+
+          authed = true
+          rsp.content = authbuf
+        } else {
+          rsp.content = buf
+        }
+        Future.value(rsp)
+      }
+  }
+
   test("getAppIds endpoint returns a seq of app names") {
     val service = stubService(appsBuf)
 
-    val response = await(Api(service, "host", "prefix").getAppIds())
+    val response = await(Api(service, "host", "prefix", None).getAppIds())
     assert(response == Set(
       Path.read("/foo"),
       Path.read("/bar"),
@@ -76,14 +97,33 @@ class ApiTest extends FunSuite with Awaits with Exceptions {
   test("getAppIds endpoint returns an empty seq when there are no apps") {
     val service = stubService(noApps)
 
-    val response = await(Api(service, "host", "prefix").getAppIds())
+    val response = await(Api(service, "host", "prefix", None).getAppIds())
     assert(response.size == 0)
+  }
+
+  test("getAppIds endpoint uses auth if provided") {
+    val service = stubAuth(authbuf, appsBuf).service()
+
+    val response = await(Api(service, "host", "prefix", auth).getAppIds())
+    assert(response == Set(
+      Path.read("/foo"),
+      Path.read("/bar"),
+      Path.read("/baz")
+    ))
+  }
+
+  test("getAppIds endpoint fails if auth fails") {
+    val service = stubAuth(Buf.Utf8("fail"), appsBuf).service()
+
+    assertThrows[Api.UnauthorizedResponse] {
+      await(Api(service, "host", "prefix", auth).getAppIds())
+    }
   }
 
   test("getAddrs endpoint returns a seq of addresses") {
     val service = stubService(appBuf)
 
-    val response = await(Api(service, "host", "prefix").getAddrs(Path.Utf8("foo")))
+    val response = await(Api(service, "host", "prefix", None).getAddrs(Path.Utf8("foo")))
     assert(response == Set(
       Address("1.2.3.4", 7000),
       Address("5.6.7.8", 7003)
@@ -93,8 +133,26 @@ class ApiTest extends FunSuite with Awaits with Exceptions {
   test("getAddrs endpoint returns an empty set of addresses if app not found") {
     val service = stubService(appNotFoundBuf)
 
-    val response = await(Api(service, "host", "prefix").getAddrs(Path.Utf8("foo")))
+    val response = await(Api(service, "host", "prefix", None).getAddrs(Path.Utf8("foo")))
     assert(response.size == 0)
+  }
+
+  test("getAddrs endpoint uses auth if provided") {
+    val service = stubAuth(authbuf, appBuf).service()
+
+    val response = await(Api(service, "host", "prefix", auth).getAddrs(Path.Utf8("foo")))
+    assert(response == Set(
+      Address("1.2.3.4", 7000),
+      Address("5.6.7.8", 7003)
+    ))
+  }
+
+  test("getAddrs endpoint fails if auth fails") {
+    val service = stubAuth(Buf.Utf8("fail"), appBuf).service()
+
+    assertThrows[Api.UnauthorizedResponse] {
+      await(Api(service, "host", "prefix", auth).getAddrs(Path.Utf8("foo")))
+    }
   }
 
   class ClientFailure extends Exception("I have no idea who to talk to")
@@ -104,7 +162,7 @@ class ApiTest extends FunSuite with Awaits with Exceptions {
       Future.exception(new ClientFailure)
     }
     assertThrows[ClientFailure] {
-      await(Api(failureService, "host", "prefix").getAppIds())
+      await(Api(failureService, "host", "prefix", None).getAppIds())
     }
   }
 }

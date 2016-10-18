@@ -101,7 +101,8 @@ object LinkerdBuild extends Base {
       .withTests()
 
     val marathon = projectDir("namer/marathon")
-      .dependsOn(LinkerdBuild.marathon, core)
+      .dependsOn(LinkerdBuild.marathon, core % "compile->compile;test->test")
+      .withLib(Deps.jwt)
       .withTests()
 
     val serversets = projectDir("namer/serversets")
