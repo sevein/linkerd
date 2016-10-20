@@ -6,7 +6,10 @@ import com.fasterxml.jackson.module.scala.experimental.ScalaObjectMapper
 import com.twitter.finagle.tracing.Trace
 import com.twitter.finagle.{Address, Path, Service, SimpleFilter, http}
 import com.twitter.io.Buf
-import com.twitter.util.{Closable, Future, Return, Time, Try}
+import com.twitter.logging.Logger
+import com.twitter.util.{Activity, Closable, Future, Return, Throw, Time, Try, Var}
+import java.net.URL
+import pdi.jwt.{Jwt, JwtAlgorithm}
 
 /**
  * A partial implementation of the Marathon V2 API:
@@ -25,22 +28,21 @@ object Api {
 
   val versionString = "v2"
 
-  case class Auth(
-    path: String,
-    content: String
-  )
+  case class AuthRequest(
+    loginEndpoint: String,
+    uid: String,
+    privateKey: String
+  ) {
+    private[this] val jwt = Jwt.encode(s"""{"uid":"$uid"}""", privateKey, JwtAlgorithm.RS256)
 
-  private[this] case class SetHost(host: String)
-    extends SimpleFilter[http.Request, http.Response] {
-
-    def apply(req: http.Request, service: Service[http.Request, http.Response]) = {
-      req.host = host
-      service(req)
-    }
+    val path = new URL(loginEndpoint).getPath
+    val jwtToken = s"""{"uid":"$uid","token":"$jwt"}"""
   }
 
-  def apply(client: Client, host: String, uriPrefix: String, auth: Option[Auth]): Api =
+  def apply(client: Client, host: String, uriPrefix: String, auth: Option[AuthRequest]): Api =
     new AppIdApi(SetHost(host).andThen(client), s"$uriPrefix/$versionString", auth)
+
+  private[v2] val log = Logger.get(getClass.getName)
 
   private[v2] def rspToApps(rsp: http.Response): Future[Api.AppIds] =
     rsp.status match {
@@ -48,8 +50,13 @@ object Api {
         val apps = readJson[AppsRsp](rsp.content).map(_.toApps)
         Future.const(apps)
       case http.Status.Unauthorized =>
-        Future.exception(UnauthorizedResponse(rsp))
-      case _ => Future.exception(UnexpectedResponse(rsp))
+        val e = UnauthorizedResponse(rsp)
+        log.error(s"rspToApps returned Unauthorized with ${e}")
+        Future.exception(e)
+      case _ =>
+        val e = UnexpectedResponse(rsp)
+        log.error(s"rspToApps returned Unexpected with ${e}")
+        Future.exception(e)
     }
 
   private[v2] def rspToAddrs(rsp: http.Response): Future[Set[Address]] =
@@ -58,15 +65,20 @@ object Api {
         val addrs = readJson[AppRsp](rsp.content).map(_.toAddresses)
         Future.const(addrs)
       case http.Status.Unauthorized =>
-        Future.exception(UnauthorizedResponse(rsp))
-      case _ => Future.exception(UnexpectedResponse(rsp))
+        val e = UnauthorizedResponse(rsp)
+        log.error(s"rspToAddrs returned Unauthorized with ${e}")
+        Future.exception(e)
+      case _ =>
+        val e = UnexpectedResponse(rsp)
+        log.error(s"rspToAddrs returned Unexpected with ${e}")
+        Future.exception(e)
     }
 
   private[v2] case class AuthToken(token: Option[String])
 
   private[v2] case class UnauthorizedResponse(rsp: http.Response) extends Throwable
 
-  private[this] case class UnexpectedResponse(rsp: http.Response) extends Throwable
+  private[v2] case class UnexpectedResponse(rsp: http.Response) extends Throwable
 
   private[this] val mapper = new ObjectMapper with ScalaObjectMapper
   mapper.registerModule(DefaultScalaModule)
@@ -74,6 +86,15 @@ object Api {
   def readJson[T: Manifest](buf: Buf): Try[T] = {
     val Buf.ByteArray.Owned(bytes, begin, end) = Buf.ByteArray.coerce(buf)
     Try(mapper.readValue[T](bytes, begin, end - begin))
+  }
+
+  private[this] case class SetHost(host: String)
+    extends SimpleFilter[http.Request, http.Response] {
+
+    def apply(req: http.Request, service: Service[http.Request, http.Response]) = {
+      req.host = host
+      service(req)
+    }
   }
 
   private[this] case class Task(
@@ -112,90 +133,119 @@ object Api {
   }
 }
 
-private class AppIdApi(client: Api.Client, apiPrefix: String, auth: Option[Api.Auth])
+private class AppIdApi(client: Api.Client, apiPrefix: String, auth: Option[Api.AuthRequest])
   extends Api
   with Closable {
 
   import Api._
 
-  var authToken: Option[String] = None
-
   def close(deadline: Time) = client.close(deadline)
+
+  private[this] val state = Var[Activity.State[Option[String]]](Activity.Ok(None))
+  private[this] val authToken = Activity(state)
 
   private[this] def refreshToken(): Future[String] =
     auth match {
-      case Some(auth) =>
-        val req = http.Request(http.Method.Post, auth.path)
-        req.setContentTypeJson()
-        req.setContentString(auth.content)
+      case None => Future.value("")
+      case Some(auth) => synchronized {
+        state.sample() match {
+          case Activity.Pending =>
+            authToken.values.toFuture.flatMap {
+              case Return(Some(token)) => Future.value(token)
+              case Return(None) => Future.value("")
+              case Throw(e) =>
+                log.error(s"authToken threw ${e}")
+                Future.exception(e)
+            }
+          case _ =>
+            state() = Activity.Pending
+            val req = http.Request(http.Method.Post, auth.path)
+            req.setContentTypeJson()
+            req.setContentString(auth.jwtToken)
 
-        Trace.letClear(client(req)).flatMap { rsp =>
-          rsp.status match {
-            case http.Status.Ok =>
-              readJson[AuthToken](rsp.content) match {
-                case Return(AuthToken(Some(token))) =>
-                  authToken = Some(token) // side effect
-                  Future.const(Return(token))
-                case _ => Future.exception(UnauthorizedResponse(rsp))
-              }
-            case _ => Future.exception(UnauthorizedResponse(rsp))
-          }
+            Trace.letClear(client(req)).transform {
+              case Return(rsp) =>
+                rsp.status match {
+                  case http.Status.Ok =>
+                    readJson[AuthToken](rsp.content) match {
+                      case Return(AuthToken(Some(token))) =>
+                        state() = Activity.Ok(Some(token))
+                        Future.value(token)
+                      case Throw(e) =>
+                        state() = Activity.Ok(None)
+                        log.error(s"refreshToken threw ${e}")
+                        Future.exception(e)
+                      case _ =>
+                        state() = Activity.Ok(None)
+                        val e = UnexpectedResponse(rsp)
+                        log.error(s"refreshToken returned Unexpected with ${e}")
+                        Future.exception(e)
+                    }
+                  case http.Status.Unauthorized =>
+                    state() = Activity.Ok(None)
+                    val e = UnauthorizedResponse(rsp)
+                    log.error(s"refreshToken returned Unauthorized with ${e}")
+                    Future.exception(e)
+                  case _ =>
+                    state() = Activity.Ok(None)
+                    val e = UnexpectedResponse(rsp)
+                    log.error(s"refreshToken returned Unexpected with ${e}")
+                    Future.exception(e)
+                }
+              case Throw(e) =>
+                state() = Activity.Ok(None)
+                log.error(s"refreshToken threw ${e}")
+                Future.exception(e)
+            }
         }
-      case _ => Future.value("")
+      }
     }
 
   private[this] def prepRequest(path: String): Future[http.Request] = {
     val req = http.Request(path)
-    (authToken, auth) match {
-      case (Some(authToken), Some(auth)) => {
-        // already have a token, set it
-        req.headerMap.set("Authorization", s"token=$authToken")
-        Future.const(Return(req))
-      }
-      case (None, Some(auth)) => {
-        // need a token, query for it
-        refreshToken().flatMap { token =>
-          req.headerMap.set("Authorization", s"token=$token")
-          Future.const(Return(req))
+    auth match {
+      case None =>
+        // no auth data, don't need a token
+        Future.value(req)
+      case Some(auth) =>
+        // we have auth data, get a token
+        authToken.values.toFuture.flatMap {
+          case Return(Some(token)) =>
+            req.headerMap.set("Authorization", s"token=$token")
+            Future.value(req)
+          case Return(None) =>
+            refreshToken().map { token =>
+              req.headerMap.set("Authorization", s"token=$token")
+              req
+            }
+          case Throw(e) =>
+            log.error(s"prepRequest threw ${e}")
+            Future.exception(e)
         }
-      }
-
-      // don't need a token
-      case _ => Future.const(Return(req))
     }
   }
 
   def getAppIds(): Future[Api.AppIds] =
     prepRequest(s"$apiPrefix/apps").flatMap { req =>
-      try {
-        Trace.letClear(client(req)).flatMap(rspToApps(_)).rescue {
-          case e: UnauthorizedResponse =>
-            // token may have expired, try again
-            refreshToken().flatMap { token =>
-              req.headerMap.set("Authorization", s"token=$token")
-              Trace.letClear(client(req)).flatMap(rspToApps(_))
-            }
-          case e => Future.exception(e)
-        }
-      } catch {
-        case e: Throwable => Future.exception(e)
+      Trace.letClear(client(req)).flatMap(rspToApps(_)).rescue {
+        case e: UnauthorizedResponse =>
+          // cached token may have expired, try again
+          refreshToken().flatMap { token =>
+            req.headerMap.set("Authorization", s"token=$token")
+            Trace.letClear(client(req)).flatMap(rspToApps(_))
+          }
       }
     }
 
   def getAddrs(app: Path): Future[Set[Address]] =
     prepRequest(s"$apiPrefix/apps${app.show}").flatMap { req =>
-      try {
-        Trace.letClear(client(req)).flatMap(rspToAddrs(_)).rescue {
-          case e: UnauthorizedResponse =>
-            // token may have expired, try again
-            refreshToken().flatMap { token =>
-              req.headerMap.set("Authorization", s"token=$token")
-              Trace.letClear(client(req)).flatMap(rspToAddrs(_))
-            }
-          case e => Future.exception(e)
-        }
-      } catch {
-        case e: Throwable => Future.exception(e)
+      Trace.letClear(client(req)).flatMap(rspToAddrs(_)).rescue {
+        case e: UnauthorizedResponse =>
+          // cached token may have expired, try again
+          refreshToken().flatMap { token =>
+            req.headerMap.set("Authorization", s"token=$token")
+            Trace.letClear(client(req)).flatMap(rspToAddrs(_))
+          }
       }
     }
 }

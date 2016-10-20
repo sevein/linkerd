@@ -10,8 +10,6 @@ import com.twitter.util.Return
 import io.buoyant.config.types.Port
 import io.buoyant.namer.{NamerConfig, NamerInitializer}
 import io.buoyant.marathon.v2.{Api, AppIdNamer}
-import java.net.URL
-import pdi.jwt.{Jwt, JwtAlgorithm}
 
 /**
  * Supports namer configurations in the form:
@@ -64,21 +62,14 @@ case class MarathonConfig(
 
   private[this] def getDst = dst.getOrElse(s"/$$/inet/$getHost/$getPort")
 
-  val secretKey = "DCOS_SERVICE_ACCOUNT_CREDENTIAL"
+  private[this] val secretKey = "DCOS_SERVICE_ACCOUNT_CREDENTIAL"
   private[this] def getAuth = {
-    if (sys.env.contains(secretKey)) {
-      Api.readJson[MarathonSecret](Buf.Utf8(sys.env(secretKey))) match {
+    sys.env.get(secretKey).flatMap { secret =>
+      Api.readJson[MarathonSecret](Buf.Utf8(secret)) match {
         case Return(MarathonSecret(Some(loginEndpoint), Some(privateKey), Some("RS256"), Some(uid))) =>
-          Some(
-            Api.Auth(
-              new URL(loginEndpoint).getPath,
-              s"""{"uid":"$uid","token":"${Jwt.encode(s"""{"uid":"$uid"}""", privateKey, JwtAlgorithm.RS256)}"}"""
-            )
-          )
+          Some(Api.AuthRequest(loginEndpoint, uid, privateKey))
         case _ => None
       }
-    } else {
-      None
     }
   }
 

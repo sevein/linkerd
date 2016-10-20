@@ -37,6 +37,7 @@ object LinkerdBuild extends Base {
   val marathon = projectDir("marathon")
     .withTwitterLib(Deps.finagle("http"))
     .withLibs(Deps.jackson)
+    .withLib(Deps.jwt)
     .withTests()
 
   object Router {
@@ -101,8 +102,7 @@ object LinkerdBuild extends Base {
       .withTests()
 
     val marathon = projectDir("namer/marathon")
-      .dependsOn(LinkerdBuild.marathon, core % "compile->compile;test->test")
-      .withLib(Deps.jwt)
+      .dependsOn(LinkerdBuild.marathon, core)
       .withTests()
 
     val serversets = projectDir("namer/serversets")
