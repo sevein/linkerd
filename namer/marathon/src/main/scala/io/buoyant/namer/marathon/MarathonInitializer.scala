@@ -63,15 +63,13 @@ case class MarathonConfig(
   private[this] def getDst = dst.getOrElse(s"/$$/inet/$getHost/$getPort")
 
   private[this] val secretKey = "DCOS_SERVICE_ACCOUNT_CREDENTIAL"
-  private[this] def getAuth = {
+  private[this] def getAuth =
     sys.env.get(secretKey).flatMap { secret =>
-      Api.readJson[MarathonSecret](Buf.Utf8(secret)) match {
-        case Return(MarathonSecret(Some(loginEndpoint), Some(privateKey), Some("RS256"), Some(uid))) =>
-          Some(Api.AuthRequest(loginEndpoint, uid, privateKey))
-        case _ => None
-      }
+      Api.readJson[MarathonSecret](Buf.Utf8(secret)).toOption
+    }.collect {
+      case MarathonSecret(Some(loginEndpoint), Some(privateKey), Some("RS256"), Some(uid)) =>
+        Api.AuthRequest(loginEndpoint, uid, privateKey)
     }
-  }
 
   /**
    * Construct a namer.

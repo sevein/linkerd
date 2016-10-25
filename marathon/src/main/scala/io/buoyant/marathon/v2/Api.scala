@@ -7,7 +7,7 @@ import com.twitter.finagle.tracing.Trace
 import com.twitter.finagle.{Address, Path, Service, SimpleFilter, http}
 import com.twitter.io.Buf
 import com.twitter.logging.Logger
-import com.twitter.util.{Activity, Closable, Future, Return, Throw, Time, Try, Var}
+import com.twitter.util._
 import java.net.URL
 import pdi.jwt.{Jwt, JwtAlgorithm}
 
@@ -51,11 +51,11 @@ object Api {
         Future.const(apps)
       case http.Status.Unauthorized =>
         val e = UnauthorizedResponse(rsp)
-        log.error(s"rspToApps returned Unauthorized with ${e}")
+        log.error(s"rspToApps returned Unauthorized with $e")
         Future.exception(e)
       case _ =>
         val e = UnexpectedResponse(rsp)
-        log.error(s"rspToApps returned Unexpected with ${e}")
+        log.error(s"rspToApps returned Unexpected with $e")
         Future.exception(e)
     }
 
@@ -66,11 +66,11 @@ object Api {
         Future.const(addrs)
       case http.Status.Unauthorized =>
         val e = UnauthorizedResponse(rsp)
-        log.error(s"rspToAddrs returned Unauthorized with ${e}")
+        log.error(s"rspToAddrs returned Unauthorized with $e")
         Future.exception(e)
       case _ =>
         val e = UnexpectedResponse(rsp)
-        log.error(s"rspToAddrs returned Unexpected with ${e}")
+        log.error(s"rspToAddrs returned Unexpected with $e")
         Future.exception(e)
     }
 
@@ -141,62 +141,74 @@ private class AppIdApi(client: Api.Client, apiPrefix: String, auth: Option[Api.A
 
   def close(deadline: Time) = client.close(deadline)
 
-  private[this] val state = Var[Activity.State[Option[String]]](Activity.Ok(None))
-  private[this] val authToken = Activity(state)
+  private[this] val authTokenState = Var[Activity.State[Option[String]]](Activity.Ok(None))
+  private[this] val authToken = Activity(authTokenState)
 
+  private[this] def handleTokenResponse(rsp: Try[http.Response]): Future[String] = rsp match {
+    case Return(rsp) =>
+      rsp.status match {
+        case http.Status.Ok =>
+          readJson[AuthToken](rsp.content) match {
+            case Return(AuthToken(Some(token))) =>
+              authTokenState() = Activity.Ok(Some(token))
+              Future.value(token)
+            case Throw(e) =>
+              authTokenState() = Activity.Ok(None)
+              log.error(s"refreshToken threw $e")
+              Future.exception(e)
+            case _ =>
+              authTokenState() = Activity.Ok(None)
+              val e = UnexpectedResponse(rsp)
+              log.error(s"refreshToken returned Unexpected with $e")
+              Future.exception(e)
+          }
+        case http.Status.Unauthorized =>
+          authTokenState() = Activity.Ok(None)
+          val e = UnauthorizedResponse(rsp)
+          log.error(s"refreshToken returned Unauthorized with $e")
+          Future.exception(e)
+        case _ =>
+          authTokenState() = Activity.Ok(None)
+          val e = UnexpectedResponse(rsp)
+          log.error(s"refreshToken returned Unexpected with $e")
+          Future.exception(e)
+      }
+    case Throw(e) =>
+      authTokenState() = Activity.Ok(None)
+      log.error(s"refreshToken threw $e")
+      Future.exception(e)
+  }
+
+  // Given AuthRequest data, attempts authentication on a marathon login
+  // endpoint. Upon success, returns a short-lived authToken, and also saves
+  // authToken for subsequent API calls.
   private[this] def refreshToken(): Future[String] =
     auth match {
       case None => Future.value("")
       case Some(auth) => synchronized {
-        state.sample() match {
+        authTokenState.sample() match {
           case Activity.Pending =>
+            // Another call to refreshToken() is currently executing, wait for that result.
             authToken.values.toFuture.flatMap {
               case Return(Some(token)) => Future.value(token)
-              case Return(None) => Future.value("")
+              case Return(None) =>
+                log.error(s"authToken was None")
+                Future.exception(new Exception("authToken was None"))
               case Throw(e) =>
-                log.error(s"authToken threw ${e}")
+                log.error(s"authToken threw $e")
                 Future.exception(e)
             }
           case _ =>
-            state() = Activity.Pending
+            // We need a token in the following cases:
+            // 1) No token present
+            // 2) Token present, but expired.
+            // The caller of refreshToken should know this.
+            authTokenState() = Activity.Pending
             val req = http.Request(http.Method.Post, auth.path)
             req.setContentTypeJson()
             req.setContentString(auth.jwtToken)
 
-            Trace.letClear(client(req)).transform {
-              case Return(rsp) =>
-                rsp.status match {
-                  case http.Status.Ok =>
-                    readJson[AuthToken](rsp.content) match {
-                      case Return(AuthToken(Some(token))) =>
-                        state() = Activity.Ok(Some(token))
-                        Future.value(token)
-                      case Throw(e) =>
-                        state() = Activity.Ok(None)
-                        log.error(s"refreshToken threw ${e}")
-                        Future.exception(e)
-                      case _ =>
-                        state() = Activity.Ok(None)
-                        val e = UnexpectedResponse(rsp)
-                        log.error(s"refreshToken returned Unexpected with ${e}")
-                        Future.exception(e)
-                    }
-                  case http.Status.Unauthorized =>
-                    state() = Activity.Ok(None)
-                    val e = UnauthorizedResponse(rsp)
-                    log.error(s"refreshToken returned Unauthorized with ${e}")
-                    Future.exception(e)
-                  case _ =>
-                    state() = Activity.Ok(None)
-                    val e = UnexpectedResponse(rsp)
-                    log.error(s"refreshToken returned Unexpected with ${e}")
-                    Future.exception(e)
-                }
-              case Throw(e) =>
-                state() = Activity.Ok(None)
-                log.error(s"refreshToken threw ${e}")
-                Future.exception(e)
-            }
+            Trace.letClear(client(req)).transform(handleTokenResponse(_))
         }
       }
     }
@@ -219,7 +231,7 @@ private class AppIdApi(client: Api.Client, apiPrefix: String, auth: Option[Api.A
               req
             }
           case Throw(e) =>
-            log.error(s"prepRequest threw ${e}")
+            log.error(s"prepRequest threw $e")
             Future.exception(e)
         }
     }
